@@ -40,17 +40,50 @@ func headerFieldOrdering(i, j Tag) bool {
 	return i < j
 }
 
+//customOrdering returns a tagOrder function
+func customOrdering(m map[Tag]uint32) tagOrder {
+	var f = func(i, j Tag) bool {
+		var ordering = func(t Tag) uint32 {
+			orderFound, ok := m[t]
+			if !ok {
+				return math.MaxUint32
+			}
+			return orderFound
+		}
+
+		orderi := ordering(i)
+		orderj := ordering(j)
+
+		switch {
+		case orderi < orderj:
+			return true
+		case orderi > orderj:
+			return false
+		}
+		return i < j
+	}
+	return f
+}
+
 //Init initializes the Header instance
-func (h *Header) Init() {
-	h.initWithOrdering(headerFieldOrdering)
+func (h *Header) Init(m ...map[Tag]uint32) {
+	if len(m) != 1 {
+		h.initWithOrdering(headerFieldOrdering)
+		return
+	}
+	h.initWithOrdering(customOrdering(m[0]))
 }
 
 //Body is the primary application section of a FIX message
 type Body struct{ FieldMap }
 
 //Init initializes the FIX message
-func (b *Body) Init() {
-	b.init()
+func (b *Body) Init(m ...map[Tag]uint32) {
+	if len(m) != 1 {
+		b.init()
+		return
+	}
+	b.initWithOrdering(customOrdering(m[0]))
 }
 
 //Trailer is the last section of a FIX message
