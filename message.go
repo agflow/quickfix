@@ -42,7 +42,7 @@ func headerFieldOrdering(i, j Tag) bool {
 
 //customOrdering returns a tagOrder function
 func customOrdering(m map[Tag]uint32) tagOrder {
-	var f = func(i, j Tag) bool {
+	return func(i, j Tag) bool {
 		var ordering = func(t Tag) uint32 {
 			orderFound, ok := m[t]
 			if !ok {
@@ -62,7 +62,6 @@ func customOrdering(m map[Tag]uint32) tagOrder {
 		}
 		return i < j
 	}
-	return f
 }
 
 //Init initializes the Header instance
