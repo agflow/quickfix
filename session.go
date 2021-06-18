@@ -342,6 +342,14 @@ func (s *session) dropQueued() {
 	s.toSend = s.toSend[:0]
 }
 
+func (s *session) EnqueueBytesAndSend(msg []byte) {
+	s.sendMutex.Lock()
+	defer s.sendMutex.Unlock()
+
+	s.toSend = append(s.toSend, msg)
+	s.sendQueued()
+}
+
 func (s *session) sendBytes(msg []byte) {
 	s.log.OnOutgoing(msg)
 	s.messageOut <- msg
@@ -465,8 +473,7 @@ func (s *session) initiateLogoutInReplyTo(reason string, inReplyTo *Message) (er
 		return
 	}
 	s.log.OnEvent("Inititated logout request")
-	time.AfterFunc(time.Duration(2)*time.Second, func() { s.sessionEvent <- internal.LogoutTimeout })
-
+	time.AfterFunc(s.LogoutTimeout, func() { s.sessionEvent <- internal.LogoutTimeout })
 	return
 }
 
@@ -623,6 +630,9 @@ func (s *session) doReject(msg *Message, rej MessageRejectError) error {
 		if rej.IsBusinessReject() {
 			reply.Header.SetField(tagMsgType, FIXString("j"))
 			reply.Body.SetField(tagBusinessRejectReason, FIXInt(rej.RejectReason()))
+			if refID := rej.BusinessRejectRefID(); refID != "" {
+				reply.Body.SetField(tagBusinessRejectRefID, FIXString(refID))
+			}
 		} else {
 			reply.Header.SetField(tagMsgType, FIXString("3"))
 			switch {
@@ -698,6 +708,15 @@ func (s *session) onAdmin(msg interface{}) {
 		if s.IsConnected() {
 			if msg.err != nil {
 				msg.err <- errors.New("Already connected")
+				close(msg.err)
+			}
+			return
+		}
+
+		if !s.IsSessionTime() {
+			s.handleDisconnectState(s)
+			if msg.err != nil {
+				msg.err <- errors.New("Connection outside of session time")
 				close(msg.err)
 			}
 			return

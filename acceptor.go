@@ -10,23 +10,35 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/armon/go-proxyproto"
 	"github.com/quickfixgo/quickfix/config"
 )
 
 //Acceptor accepts connections from FIX clients and manages the associated sessions.
 type Acceptor struct {
-	app                Application
-	settings           *Settings
-	logFactory         LogFactory
-	storeFactory       MessageStoreFactory
-	globalLog          Log
-	sessions           map[SessionID]*session
-	sessionGroup       sync.WaitGroup
-	listener           net.Listener
-	listenerShutdown   sync.WaitGroup
-	dynamicSessions    bool
-	dynamicSessionChan chan *session
+	app                   Application
+	settings              *Settings
+	logFactory            LogFactory
+	storeFactory          MessageStoreFactory
+	globalLog             Log
+	sessions              map[SessionID]*session
+	sessionGroup          sync.WaitGroup
+	listener              net.Listener
+	listenerShutdown      sync.WaitGroup
+	dynamicSessions       bool
+	dynamicQualifier      bool
+	dynamicQualifierCount int
+	dynamicSessionChan    chan *session
+	sessionAddr           map[SessionID]net.Addr
+	connectionValidator   ConnectionValidator
 	sessionFactory
+}
+
+// ConnectionValidator is an interface allowing to implement a custom authentication logic.
+type ConnectionValidator interface {
+	// Validate the connection for validity. This can be a part of authentication process.
+	// For example, you may tie up a SenderCompID to an IP range, or to a specific TLS certificate as a part of mTLS.
+	Validate(netConn net.Conn, session SessionID) error
 }
 
 //Start accepting connections.
@@ -49,11 +61,24 @@ func (a *Acceptor) Start() error {
 		return err
 	}
 
+	var useTCPProxy bool
+	if a.settings.GlobalSettings().HasSetting(config.UseTCPProxy) {
+		if useTCPProxy, err = a.settings.GlobalSettings().BoolSetting(config.UseTCPProxy); err != nil {
+			return err
+		}
+	}
+
 	address := net.JoinHostPort(socketAcceptHost, strconv.Itoa(socketAcceptPort))
 	if tlsConfig != nil {
 		if a.listener, err = tls.Listen("tcp", address, tlsConfig); err != nil {
 			return err
 		}
+	} else if useTCPProxy {
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			return err
+		}
+		a.listener = &proxyproto.Listener{Listener: listener}
 	} else {
 		if a.listener, err = net.Listen("tcp", address); err != nil {
 			return err
@@ -98,6 +123,12 @@ func (a *Acceptor) Stop() {
 	a.sessionGroup.Wait()
 }
 
+//Get remote IP address for a given session.
+func (a *Acceptor) RemoteAddr(sessionID SessionID) (net.Addr, bool) {
+	addr, ok := a.sessionAddr[sessionID]
+	return addr, ok
+}
+
 //NewAcceptor creates and initializes a new Acceptor.
 func NewAcceptor(app Application, storeFactory MessageStoreFactory, settings *Settings, logFactory LogFactory) (a *Acceptor, err error) {
 	a = &Acceptor{
@@ -106,10 +137,17 @@ func NewAcceptor(app Application, storeFactory MessageStoreFactory, settings *Se
 		settings:     settings,
 		logFactory:   logFactory,
 		sessions:     make(map[SessionID]*session),
+		sessionAddr:  make(map[SessionID]net.Addr),
 	}
 	if a.settings.GlobalSettings().HasSetting(config.DynamicSessions) {
 		if a.dynamicSessions, err = settings.globalSettings.BoolSetting(config.DynamicSessions); err != nil {
 			return
+		}
+
+		if a.settings.GlobalSettings().HasSetting(config.DynamicQualifier) {
+			if a.dynamicQualifier, err = settings.globalSettings.BoolSetting(config.DynamicQualifier); err != nil {
+				return
+			}
 		}
 	}
 
@@ -237,6 +275,19 @@ func (a *Acceptor) handleConnection(netConn net.Conn) {
 		SenderCompID: string(targetCompID), SenderSubID: string(targetSubID), SenderLocationID: string(targetLocationID),
 		TargetCompID: string(senderCompID), TargetSubID: string(senderSubID), TargetLocationID: string(senderLocationID),
 	}
+
+	// We have a session ID and a network connection. This seems to be a good place for any custom authentication logic.
+	if a.connectionValidator != nil {
+		if err := a.connectionValidator.Validate(netConn, sessID); err != nil {
+			a.globalLog.OnEventf("Unable to validate a connection %v", err.Error())
+			return
+		}
+	}
+
+	if a.dynamicQualifier {
+		a.dynamicQualifierCount++
+		sessID.Qualifier = strconv.Itoa(a.dynamicQualifierCount)
+	}
 	session, ok := a.sessions[sessID]
 	if !ok {
 		if !a.dynamicSessions {
@@ -253,6 +304,7 @@ func (a *Acceptor) handleConnection(netConn net.Conn) {
 		defer session.stop()
 	}
 
+	a.sessionAddr[sessID] = netConn.RemoteAddr()
 	msgIn := make(chan fixIn)
 	msgOut := make(chan []byte)
 
@@ -297,7 +349,13 @@ LOOP:
 				complete <- sessionID
 			}()
 		case id := <-complete:
-			delete(sessions, id)
+			session, ok := sessions[id]
+			if ok {
+				delete(a.sessionAddr, session.sessionID)
+				delete(sessions, id)
+			} else {
+				a.globalLog.OnEventf("Missing dynamic session %v!", id)
+			}
 		}
 	}
 
@@ -311,4 +369,13 @@ LOOP:
 			return
 		}
 	}
+}
+
+// SetConnectionValidator sets an optional connection validator.
+// Use it when you need a custom authentication logic that includes lower level interactions,
+// like mTLS auth or IP whitelistening.
+// To remove a previously set validator call it with a nil value:
+// 	a.SetConnectionValidator(nil)
+func (a *Acceptor) SetConnectionValidator(validator ConnectionValidator) {
+	a.connectionValidator = validator
 }
